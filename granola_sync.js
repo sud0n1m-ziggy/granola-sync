@@ -17,9 +17,11 @@ const SUPABASE_PATH = path.join(
   'Granola',
   'supabase.json',
 );
-const API_ENDPOINT = 'https://api.granola.ai/v1/get-documents';
+const API_ENDPOINT = 'https://api.granola.ai/v2/get-documents';
+const TRANSCRIPT_ENDPOINT = 'https://api.granola.ai/v1/get-document-transcript';
 const LOG_FILE = path.join(__dirname, 'granola_sync.log');
 const ERROR_SLEEP_MS = 60_000;
+const TRANSCRIPT_DELAY_MS = 500;
 
 function formatTimestamp(date = new Date()) {
   const pad = (value) => String(value).padStart(2, '0');
@@ -129,9 +131,9 @@ function readToken() {
   return token;
 }
 
-function fetchDocuments(token) {
+function fetchDocumentsPage(token, limit, offset) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ limit: 500 });
+    const body = JSON.stringify({ limit, offset, include_last_viewed_panel: true });
     const request = https.request(
       API_ENDPOINT,
       {
@@ -165,7 +167,7 @@ function fetchDocuments(token) {
           }
 
           try {
-            const data = responseBody ? JSON.parse(responseBody) : [];
+            const data = responseBody ? JSON.parse(responseBody) : {};
             resolve(data);
           } catch (error) {
             reject(new Error(`Failed to parse API response: ${error.message}`));
@@ -178,6 +180,124 @@ function fetchDocuments(token) {
     request.write(body);
     request.end();
   });
+}
+
+async function fetchDocuments(token) {
+  const limit = 100;
+  let offset = 0;
+  const allDocs = [];
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const response = await fetchDocumentsPage(token, limit, offset);
+    const docs = Array.isArray(response.docs) ? response.docs : [];
+    
+    allDocs.push(...docs);
+    
+    if (docs.length < limit) {
+      break;
+    }
+    
+    offset += limit;
+  }
+
+  return allDocs;
+}
+
+function fetchTranscript(token, documentId) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ document_id: documentId });
+    const request = https.request(
+      TRANSCRIPT_ENDPOINT,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'Accept-Encoding': 'gzip, deflate',
+        },
+      },
+      (response) => {
+        let stream = response;
+        const encoding = (response.headers['content-encoding'] || '').toLowerCase();
+        if (encoding === 'gzip') {
+          stream = response.pipe(zlib.createGunzip());
+        } else if (encoding === 'deflate') {
+          stream = response.pipe(zlib.createInflate());
+        }
+
+        const chunks = [];
+        stream.on('data', (chunk) => chunks.push(chunk));
+        stream.on('end', () => {
+          const responseBody = Buffer.concat(chunks).toString('utf8');
+          
+          if (response.statusCode === 404) {
+            resolve(null);
+            return;
+          }
+          
+          if (response.statusCode && response.statusCode >= 400) {
+            const error = new Error(`Transcript API returned ${response.statusCode}`);
+            error.statusCode = response.statusCode;
+            error.body = responseBody;
+            reject(error);
+            return;
+          }
+
+          try {
+            const data = responseBody ? JSON.parse(responseBody) : null;
+            const utterances = Array.isArray(data) ? data : (data && Array.isArray(data.utterances) ? data.utterances : null);
+            resolve(utterances);
+          } catch (error) {
+            reject(new Error(`Failed to parse transcript response: ${error.message}`));
+          }
+        });
+      },
+    );
+
+    request.on('error', (error) => reject(error));
+    request.write(body);
+    request.end();
+  });
+}
+
+function formatSecondsToTimestamp(seconds) {
+  const totalSeconds = Math.floor(seconds);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  
+  const pad = (num) => String(num).padStart(2, '0');
+  return `${pad(hours)}:${pad(minutes)}:${pad(secs)}`;
+}
+
+function formatTranscriptFromUtterances(utterances, meetingTitle, meetingDate) {
+  const lines = [
+    `# Transcript: ${meetingTitle}`,
+    `*${meetingDate || 'Unknown date'}*`,
+    '',
+  ];
+
+  if (!Array.isArray(utterances) || utterances.length === 0) {
+    return null;
+  }
+
+  utterances.forEach((utterance) => {
+    if (!utterance) {
+      return;
+    }
+    const timestamp = utterance.start_timestamp ? formatSecondsToTimestamp(utterance.start_timestamp) : '00:00:00';
+    const source = utterance.source || 'Unknown';
+    const text = (utterance.text || '').trim();
+
+    if (text) {
+      lines.push(`**[${timestamp}] ${source}:** ${text}`);
+      lines.push('');
+    }
+  });
+
+  return lines.join('\n');
 }
 
 function formatTranscript(panels) {
@@ -219,9 +339,9 @@ function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function saveMeeting(outputDir, doc) {
+async function saveMeeting(outputDir, doc, token) {
   if (!doc || !doc.id) {
-    return { status: 'skipped', changed: false };
+    return { status: 'skipped', changed: false, needsTranscript: false };
   }
 
   const docId = String(doc.id);
@@ -229,13 +349,16 @@ function saveMeeting(outputDir, doc) {
   ensureDir(meetingDir);
 
   const metaPath = path.join(meetingDir, 'metadata.json');
+  const transcriptJsonPath = path.join(meetingDir, 'transcript.json');
   let status = 'new';
+  let needsTranscript = false;
 
   if (fs.existsSync(metaPath)) {
     try {
       const existing = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
       if (existing.updated_at === doc.updated_at) {
-        return { status: 'unchanged', changed: false };
+        needsTranscript = !fs.existsSync(transcriptJsonPath);
+        return { status: 'unchanged', changed: false, needsTranscript };
       }
       status = 'updated';
     } catch (error) {
@@ -255,17 +378,18 @@ function saveMeeting(outputDir, doc) {
   writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`);
   writeFile(path.join(meetingDir, 'document.json'), `${JSON.stringify(doc, null, 2)}\n`);
 
-  const content = doc && typeof doc.content === 'object' ? doc.content : {};
-  const panels = Array.isArray(content.children) ? content.children : [];
-  const transcriptLines = formatTranscript(panels);
-  if (transcriptLines.length > 0) {
-    const transcriptMd = `# ${metadata.title}\n*${metadata.created_at || 'Unknown date'}*\n\n${transcriptLines.join('\n')}\n`;
-    writeFile(path.join(meetingDir, 'transcript.md'), transcriptMd);
-    writeFile(path.join(meetingDir, 'transcript.json'), `${JSON.stringify(panels, null, 2)}\n`);
-  }
-
+  // Save notes using notes_markdown or notes_plain
+  const notesMarkdown = doc.notes_markdown;
+  const notesPlain = doc.notes_plain;
   const notes = doc.notes || doc.summary;
-  if (notes !== undefined && notes !== null) {
+  
+  if (notesMarkdown) {
+    const notesMd = `# Notes: ${metadata.title}\n\n${notesMarkdown}\n`;
+    writeFile(path.join(meetingDir, 'notes.md'), notesMd);
+  } else if (notesPlain) {
+    const notesMd = `# Notes: ${metadata.title}\n\n${notesPlain}\n`;
+    writeFile(path.join(meetingDir, 'notes.md'), notesMd);
+  } else if (notes !== undefined && notes !== null) {
     let notesBody;
     if (typeof notes === 'string') {
       notesBody = notes.trim();
@@ -276,7 +400,10 @@ function saveMeeting(outputDir, doc) {
     writeFile(path.join(meetingDir, 'notes.md'), notesMd);
   }
 
-  return { status, changed: true };
+  // Check if we need to fetch transcript
+  needsTranscript = !fs.existsSync(transcriptJsonPath);
+
+  return { status, changed: true, needsTranscript };
 }
 
 function shellQuote(value) {
@@ -340,9 +467,9 @@ async function syncOnce(config) {
   ensureDir(outputDir);
 
   log('Fetching meetings from Granola...');
-  let documentsResponse;
+  let documents;
   try {
-    documentsResponse = await fetchDocuments(token);
+    documents = await fetchDocuments(token);
   } catch (error) {
     if (error.statusCode === 401) {
       log('ERROR: Unauthorized. Token expired? Open Granola to refresh.');
@@ -352,21 +479,16 @@ async function syncOnce(config) {
     return;
   }
 
-  const documents = Array.isArray(documentsResponse)
-    ? documentsResponse
-    : Array.isArray(documentsResponse.documents)
-      ? documentsResponse.documents
-      : [];
-
   log(`Found ${documents.length} meetings.`);
 
   let newCount = 0;
   let updatedCount = 0;
   let unchangedCount = 0;
   let skippedCount = 0;
+  const transcriptQueue = [];
 
-  documents.forEach((doc) => {
-    const result = saveMeeting(outputDir, doc);
+  for (const doc of documents) {
+    const result = await saveMeeting(outputDir, doc, token);
     switch (result.status) {
       case 'new':
         newCount += 1;
@@ -382,9 +504,56 @@ async function syncOnce(config) {
       default:
         skippedCount += 1;
     }
-  });
+
+    if (result.needsTranscript) {
+      transcriptQueue.push(doc);
+    }
+  }
 
   log(`Sync complete → ${newCount} new, ${updatedCount} updated, ${unchangedCount} unchanged, ${skippedCount} skipped.`);
+
+  // Fetch transcripts for documents that need them
+  if (transcriptQueue.length > 0) {
+    log(`Fetching transcripts for ${transcriptQueue.length} meetings...`);
+    let transcriptFetchedCount = 0;
+    let transcriptSkippedCount = 0;
+
+    for (const doc of transcriptQueue) {
+      const docId = String(doc.id);
+      const meetingDir = path.join(outputDir, docId);
+      const transcriptJsonPath = path.join(meetingDir, 'transcript.json');
+      const transcriptMdPath = path.join(meetingDir, 'transcript.md');
+
+      try {
+        const utterances = await fetchTranscript(token, docId);
+
+        if (utterances && utterances.length > 0) {
+          writeFile(transcriptJsonPath, `${JSON.stringify(utterances, null, 2)}\n`);
+
+          const meetingTitle = doc.title || 'Untitled';
+          const meetingDate = doc.created_at || 'Unknown date';
+          const transcriptMd = formatTranscriptFromUtterances(utterances, meetingTitle, meetingDate);
+
+          if (transcriptMd) {
+            writeFile(transcriptMdPath, transcriptMd);
+          }
+
+          transcriptFetchedCount += 1;
+          log(`  TRANSCRIPT: ${doc.title || doc.id}`);
+        } else {
+          transcriptSkippedCount += 1;
+        }
+
+        // Rate limiting: wait 500ms between requests
+        await sleep(TRANSCRIPT_DELAY_MS);
+      } catch (error) {
+        log(`  ERROR fetching transcript for ${doc.title || doc.id}: ${error.message}`);
+        transcriptSkippedCount += 1;
+      }
+    }
+
+    log(`Transcripts fetched: ${transcriptFetchedCount}, skipped/unavailable: ${transcriptSkippedCount}`);
+  }
 
   syncRemote(config, outputDir);
 }
