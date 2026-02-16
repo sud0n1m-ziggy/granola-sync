@@ -1,10 +1,7 @@
 {
-  "output_dir": "~/granola-meetings",
+  "output_dir": "~/.openclaw/workspace/projects/granola-sync/meetings",
   "sync_interval_minutes": 60,
   "remote": {
-    "enabled": true,
-    "host": "ziggy",
-    "path": "~/granola-meetings",
-    "method": "rsync"
+    "enabled": false
   }
 }

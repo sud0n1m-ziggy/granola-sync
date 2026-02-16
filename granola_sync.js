@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
+const zlib = require('zlib');
 const { execSync } = require('child_process');
 
 const { loadConfig } = require('./config');
@@ -139,12 +140,21 @@ function fetchDocuments(token) {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
+          'Accept-Encoding': 'gzip, deflate',
         },
       },
       (response) => {
+        let stream = response;
+        const encoding = (response.headers['content-encoding'] || '').toLowerCase();
+        if (encoding === 'gzip') {
+          stream = response.pipe(zlib.createGunzip());
+        } else if (encoding === 'deflate') {
+          stream = response.pipe(zlib.createInflate());
+        }
+
         const chunks = [];
-        response.on('data', (chunk) => chunks.push(chunk));
-        response.on('end', () => {
+        stream.on('data', (chunk) => chunks.push(chunk));
+        stream.on('end', () => {
           const responseBody = Buffer.concat(chunks).toString('utf8');
           if (response.statusCode && response.statusCode >= 400) {
             const error = new Error(`Granola API returned ${response.statusCode}`);
