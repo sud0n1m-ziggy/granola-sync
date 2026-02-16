@@ -1,39 +1,45 @@
 # GranolaSync
 
-A macOS service that syncs [Granola](https://granola.ai) meeting transcripts to a local directory and optionally to a remote machine via rsync/SSH.
-
-Designed for setups where Granola runs on your laptop but you want transcripts available on a headless server (e.g., an OpenClaw Mac Mini).
+A macOS-friendly Node.js service that syncs [Granola](https://granola.ai) meeting transcripts to a local directory and (optionally) to a remote machine via rsync/SCP.
 
 ## How it works
 
-1. Reads Granola's auth token from `~/Library/Application Support/Granola/supabase.json`
-2. Fetches all meetings via Granola's internal API
-3. Saves each meeting as structured files (metadata, transcript, notes)
-4. Optionally rsyncs the output directory to a remote machine
+1. Reads Granola's WorkOS token from `~/Library/Application Support/Granola/supabase.json`
+2. Calls Granola's internal API to fetch every meeting (500 max per request)
+3. Saves each meeting in a structured directory (metadata, transcript, notes, raw JSON)
+4. Optionally mirrors the output directory to a remote host using rsync or scp
 
-## Install
+## Requirements
+
+- macOS (Granola stores its auth token locally)
+- Node.js 18+
+- Granola desktop app installed & signed in (token refreshes when you open the app)
+- Optional: SSH access to the remote host for rsync/scp
+
+## Setup
 
 ```bash
 # Clone
 git clone https://github.com/sud0n1m-ziggy/granola-sync.git
 cd granola-sync
 
-# Install dependencies
-pip3 install -r requirements.txt
-
-# Configure
+# (Optional) customize config
 cp config.example.json config.json
-# Edit config.json with your settings
+# Edit config.json to set output directory, interval, remote target, etc.
 ```
 
+No npm dependencies are required; this project only uses Node.js built-ins.
+
 ## Configuration
+
+`config.json` (or `config.example.json` as a fallback) drives the sync:
 
 ```json
 {
   "output_dir": "~/granola-meetings",
   "sync_interval_minutes": 60,
   "remote": {
-    "enabled": false,
+    "enabled": true,
     "host": "ziggy",
     "path": "~/granola-meetings",
     "method": "rsync"
@@ -41,37 +47,47 @@ cp config.example.json config.json
 }
 ```
 
-- `output_dir`: Where to save meetings locally
-- `sync_interval_minutes`: How often to check for new meetings
-- `remote.enabled`: Whether to rsync to a remote machine
-- `remote.host`: SSH/Tailscale hostname of the remote machine
-- `remote.path`: Destination path on the remote machine
-- `remote.method`: `rsync` (default) or `scp`
+- `output_dir` — Local directory for synced meetings (supports `~`)
+- `sync_interval_minutes` — Loop interval when running without `--once`
+- `remote.enabled` — Run rsync/scp after each sync cycle
+- `remote.host` — SSH/Tailscale hostname
+- `remote.path` — Destination path on the remote host (supports `~`)
+- `remote.method` — `rsync` (default) or `scp`
 
-## Usage
+## CLI usage
 
-### One-shot sync
 ```bash
-python3 granola_sync.py
+node granola_sync.js            # Loop mode (default interval)
+node granola_sync.js --once     # Single sync and exit
+node granola_sync.js --config path/to/config.json
+
+# Via npm scripts
+npm run sync                    # Same as --once
+npm start                       # Same as loop mode
 ```
 
-### Run as a background service (launchd)
+### Logging
+
+All output is timestamped and appended to `granola_sync.log` in the project directory. Errors (missing token, API failures, etc.) also land there.
+
+## Run as a launchd service
+
 ```bash
 ./install_service.sh
 ```
 
-This installs a launchd plist that runs GranolaSync every hour. The service starts automatically on login.
+The installer:
 
-### Manage the service
+- Ensures `config.json` exists (copies from the example if needed)
+- Writes `~/Library/LaunchAgents/com.granolasync.plist`
+- Configures launchd to run `node granola_sync.js --once --config ~/.../config.json` every hour and on login
+
+Manage the service:
+
 ```bash
-# Check status
 launchctl list | grep granolasync
-
-# Stop
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.granolasync.plist
-
-# Restart
 launchctl kickstart -k gui/$(id -u)/com.granolasync
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.granolasync.plist
 ```
 
 ## Output structure
@@ -79,23 +95,18 @@ launchctl kickstart -k gui/$(id -u)/com.granolasync
 ```
 ~/granola-meetings/
   {meeting-id}/
-    metadata.json    # title, date, attendees, duration
-    transcript.md    # formatted transcript
-    transcript.json  # raw transcript data
+    metadata.json    # id, title, timestamps, attendees, calendar event
     document.json    # full API response
-    notes.md         # AI-generated summary (if available)
+    transcript.md    # formatted transcript panels
+    transcript.json  # raw transcript panels
+    notes.md         # AI-generated summary (when available)
 ```
 
-## Requirements
-
-- macOS (reads Granola's local auth file)
-- Python 3.9+
-- Granola desktop app installed and signed in
-- For remote sync: SSH access to destination (e.g., via Tailscale)
+Meetings that have not changed (`updated_at` untouched) are skipped on subsequent runs.
 
 ## Token expiry
 
-Granola's auth tokens expire after ~6 hours. The service will warn you if the token is expired. Opening the Granola app refreshes the token automatically.
+Granola tokens expire roughly every 6 hours. If the sync logs a warning about an expired token, simply open the Granola desktop app to refresh the WorkOS token.
 
 ## License
 

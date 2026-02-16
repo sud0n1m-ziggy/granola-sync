@@ -1,18 +1,24 @@
 {
   "name": "granola-sync",
-  "version": "1.0.0",
-  "description": "A macOS service that syncs [Granola](https://granola.ai) meeting transcripts to a local directory and optionally to a remote machine via rsync/SSH.",
-  "main": "index.js",
+  "version": "2.0.0",
+  "description": "Granola meeting sync service for macOS (Node.js rewrite).",
+  "main": "granola_sync.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "sync": "node granola_sync.js --once",
+    "start": "node granola_sync.js"
   },
+  "keywords": [
+    "granola",
+    "transcripts",
+    "sync",
+    "macos"
+  ],
+  "author": "",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sud0n1m-ziggy/granola-sync.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "bugs": {
     "url": "https://github.com/sud0n1m-ziggy/granola-sync/issues"
   },
