@@ -36,7 +36,6 @@ function formatTimestamp(date = new Date()) {
 
 function log(message) {
   const line = `[${formatTimestamp()}] ${message}`;
-  console.log(line);
   try {
     fs.appendFileSync(LOG_FILE, `${line}\n`);
   } catch (error) {
